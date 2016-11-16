@@ -1,26 +1,59 @@
-use {Message, Body};
-use super::{multiplex, RequestId, Transport, Multiplex, MultiplexMessage};
+use super::{Frame, RequestId, StreamingMultiplex};
+use super::advanced::{Multiplex, MultiplexMessage};
+
+use BindServer;
+use streaming::{Message, Body};
+use transport::Transport;
 use tokio_service::Service;
-use futures::{Future, Poll, Async};
+use tokio_core::io::Io;
+use futures::{BoxFuture, Future, Poll, Async};
 use futures::stream::Stream;
 use std::io;
 
-/// A server `Task` that dispatches `Transport` messages to a `Service` using
-/// protocol multiplexing.
-pub struct Server<S, T, B>
-    where T: Transport,
-          S: Service<Request = Message<T::Out, Body<T::BodyOut, T::Error>>,
-                    Response = Message<T::In, B>,
-                       Error = T::Error> + 'static,
-          B: Stream<Item = T::BodyIn, Error = T::Error> + 'static,
-{
-    inner: Multiplex<Dispatch<S, T>>,
+pub trait Server<T: Io> {
+    type Request;
+    type RequestBody;
+
+    type Response;
+    type ResponseBody;
+
+    type Error: From<io::Error>;
+
+    type Transport: Transport<Item = Frame<Self::Request, Self::RequestBody, Self::Error>,
+                              SinkItem = Frame<Self::Response, Self::ResponseBody, Self::Error>,
+                              Error = io::Error>;
+    fn bind_transport(&self, io: T) -> Self::Transport;
 }
 
-struct Dispatch<S, T> where S: Service {
+impl<P, T, B> BindServer<super::StreamingMultiplex<B>, T> for P where
+    P: Server<T>,
+    T: Io,
+    B: Stream<Item = P::ResponseBody, Error = P::Error>,
+{
+    type ServiceRequest = Message<P::Request, Body<P::RequestBody, P::Error>>;
+    type ServiceResponse = Message<P::Response, B>;
+    type ServiceError = P::Error;
+
+    fn bind_server<S>(&self, io: T, service: S) -> BoxFuture<(), P::Error> where
+        S: Service<Request = Self::ServiceRequest,
+                   Response = Self::ServiceResponse,
+                   Error = Self::ServiceError>
+    {
+        let dispatch = Dispatch {
+            service: service,
+            transport: self.bind_transport(io),
+            in_flight: vec![],
+        };
+
+        // Create the pipeline dispatcher
+        Box::new(Multiplex::new(dispatch))
+    }
+}
+
+struct Dispatch<S, T, P> where T: Io, P: Server<T>, S: Service {
     // The service handling the connection
     service: S,
-    transport: T,
+    transport: P::Transport,
     in_flight: Vec<(RequestId, InFlight<S::Future>)>,
 }
 
@@ -32,51 +65,21 @@ enum InFlight<F: Future> {
 /// The total number of requests that can be in flight at once.
 const MAX_IN_FLIGHT_REQUESTS: usize = 32;
 
-/*
- *
- * ===== Server =====
- *
- */
-
-impl<S, T, B> Server<S, T, B>
-    where T: Transport,
-          S: Service<Request = Message<T::Out, Body<T::BodyOut, T::Error>>,
-                    Response = Message<T::In, B>,
-                       Error = T::Error> + 'static,
-          B: Stream<Item = T::BodyIn, Error = T::Error>,
+impl<P, T, B, S> super::advanced::Dispatch for Dispatch<S, T, P> where
+    P: Server<T>,
+    T: Io,
+    B: Stream<Item = P::ResponseBody, Error = P::Error>,
+    S: Service<Request = Message<P::Request, Body<P::RequestBody, P::Error>>,
+               Response = Message<P::Response, B>,
+               Error = P::Error>,
 {
-    /// Create a new pipeline `Server` dispatcher with the given service and
-    /// transport
-    pub fn new(service: S, transport: T) -> Server<S, T, B> {
-        let dispatch = Dispatch {
-            service: service,
-            transport: transport,
-            in_flight: vec![],
-        };
-
-        // Create the multiplexer
-        let multiplex = Multiplex::new(dispatch);
-
-        // Return the server task
-        Server { inner: multiplex }
-    }
-}
-
-impl<S, T, B> multiplex::Dispatch for Dispatch<S, T>
-    where T: Transport,
-          S: Service<Request = Message<T::Out, Body<T::BodyOut, T::Error>>,
-                    Response = Message<T::In, B>,
-                       Error = T::Error> + 'static,
-          B: Stream<Item = T::BodyIn, Error = T::Error> + 'static,
-{
-
-    type In = T::In;
-    type BodyIn = T::BodyIn;
-    type Out = T::Out;
-    type BodyOut = T::BodyOut;
-    type Error = T::Error;
+    type In = P::Response;
+    type BodyIn = P::ResponseBody;
+    type Out = P::Request;
+    type BodyOut = P::RequestBody;
+    type Error = P::Error;
     type Stream = B;
-    type Transport = T;
+    type Transport = P::Transport;
 
     fn transport(&mut self) -> &mut T {
         &mut self.transport
@@ -95,7 +98,6 @@ impl<S, T, B> multiplex::Dispatch for Dispatch<S, T>
         }
 
         if let Some(idx) = idx {
-            // let (request_id, message) = self.in_flight.remove(idx);
             let (request_id, message) = self.in_flight.remove(idx);
             let message = MultiplexMessage {
                 id: request_id,
@@ -137,25 +139,6 @@ impl<S, T, B> multiplex::Dispatch for Dispatch<S, T>
     fn cancel(&mut self, _request_id: RequestId) -> io::Result<()> {
         // TODO: implement
         Ok(())
-    }
-}
-
-impl<S, T, B> Future for Server<S, T, B>
-    where T: Transport,
-          S: Service<Request = Message<T::Out, Body<T::BodyOut, T::Error>>,
-                    Response = Message<T::In, B>,
-                       Error = T::Error> + 'static,
-          B: Stream<Item = T::BodyIn, Error = T::Error>,
-{
-    type Item = ();
-    type Error = ();
-
-    fn poll(&mut self) -> Poll<(), ()> {
-        self.inner.poll()
-            .map_err(|e| {
-                debug!("multiplex server connection hit error; {:?}", e);
-                ()
-            })
     }
 }
 

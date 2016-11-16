@@ -1,60 +1,90 @@
-use {Error, Body, Message};
-use super::{multiplex, Transport, RequestId, Multiplex, MultiplexMessage};
-use client::{self, Client, Receiver};
+use super::{Frame, RequestId, StreamingMultiplex};
+use super::advanced::{Multiplex, MultiplexMessage};
+
+use BindClient;
+use error::Error;
+use streaming::{Body, Message};
+use transport::Transport;
+use util::client_proxy::{self, ClientProxy, Receiver};
 use futures::{Future, Complete, Poll, Async};
 use futures::stream::Stream;
 use tokio_core::reactor::Handle;
+use tokio_core::io::Io;
 use std::io;
 use std::collections::HashMap;
 
-struct Dispatch<T, B>
-    where T: Transport,
-          B: Stream<Item = T::BodyIn, Error = T::Error>,
+pub trait Client<T: Io> {
+    type Request;
+    type RequestBody;
+
+    type Response;
+    type ResponseBody;
+
+    type Error: From<io::Error>;
+
+    type Transport: Transport<Item = Frame<Self::Response, Self::ResponseBody, Self::Error>,
+                              SinkItem = Frame<Self::Request, Self::RequestBody, Self::Error>,
+                              Error = io::Error>;
+    fn bind_transport(&self, io: T) -> Self::Transport;
+}
+
+impl<P, T, B> BindClient<StreamingMultiplex<B>, T> for P where
+    P: Client<T>,
+    T: Io,
+    B: Stream<Item = P::RequestBody, Error = P::Error>,
 {
-    transport: T,
-    requests: Receiver<T::In, T::Out, B, Body<T::BodyOut, T::Error>, T::Error>,
-    in_flight: HashMap<RequestId, Complete<Result<Message<T::Out, Body<T::BodyOut, T::Error>>, T::Error>>>,
+    type ServiceRequest = Message<P::Request, B>;
+    type ServiceResponse = Message<P::Response, Body<P::ResponseBody, P::Error>>;
+    type ServiceError = P::Error;
+
+    type BindClient = ClientProxy<Self::ServiceRequest, Self::ServiceResponse, Self::ServiceError>;
+
+    fn bind_client(&self, handle: &Handle, io: T) -> Self::BindClient {
+        let (client, rx) = client_proxy::pair();
+
+        let dispatch = Dispatch {
+            transport: self.bind_transport(io),
+            requests: rx,
+            in_flight: HashMap::new(),
+            next_request_id: 0,
+        };
+
+        let task = Multiplex::new(dispatch) .map_err(|e| {
+            // TODO: where to punt this error to?
+            debug!("multiplex task failed with error; err={:?}", e);
+        });
+
+        // Spawn the task
+        handle.spawn(task);
+
+        // Return the client
+        client
+    }
+}
+
+struct Dispatch<P, T, B> where
+    P: Client<T> + BindClient<StreamingMultiplex<B>, T>,
+    T: Io,
+    B: Stream<Item = P::RequestBody, Error = P::Error>,
+{
+    transport: P::Transport,
+    requests: Receiver<P::ServiceRequest, P::ServiceResponse, P::ServiceError>,
+    in_flight: HashMap<RequestId, Complete<Result<P::ServiceResponse, P::ServiceError>>>,
     next_request_id: u64,
 }
 
-/// Connect to the given `addr` and handle using the given Transport and protocol pipelining.
-pub fn connect<T, B>(transport: T, handle: &Handle)
-    -> Client<T::In, T::Out, B, Body<T::BodyOut, T::Error>, T::Error>
-    where T: Transport,
-          B: Stream<Item = T::BodyIn, Error = T::Error> + 'static,
+impl<P, T, B> super::advanced::Dispatch for Dispatch<P, T, B> where
+    P: Client<T>,
+    T: Io,
+    B: Stream<Item = P::RequestBody, Error = P::Error>,
 {
-    let (client, rx) = client::pair();
-
-    let dispatch: Dispatch<T, B> = Dispatch {
-        transport: transport,
-        requests: rx,
-        in_flight: HashMap::new(),
-        next_request_id: 0,
-    };
-
-    let task = Multiplex::new(dispatch)
-        .map_err(|err| {
-            debug!("multiplex task failed with error; err={:?}", err);
-        });
-
-    // Spawn the task
-    handle.spawn(task);
-
-    // Return the client
-    client
-}
-
-impl<T, B> multiplex::Dispatch for Dispatch<T, B>
-    where T: Transport,
-          B: Stream<Item = T::BodyIn, Error = T::Error> + 'static,
-{
-    type In = T::In;
-    type BodyIn = T::BodyIn;
-    type Out = T::Out;
-    type BodyOut = T::BodyOut;
-    type Error = T::Error;
+    type In = P::Request;
+    type BodyIn = P::RequestBody;
+    type Out = P::Response;
+    type BodyOut = P::ResponseBody;
+    type Error = P::Error;
     type Stream = B;
-    type Transport = T;
+        type Transport = P::Transport;
 
     fn transport(&mut self) -> &mut Self::Transport {
         &mut self.transport
@@ -121,9 +151,10 @@ impl<T, B> multiplex::Dispatch for Dispatch<T, B>
     }
 }
 
-impl<T, B> Drop for Dispatch<T, B>
-    where T: Transport,
-          B: Stream<Item = T::BodyIn, Error = T::Error>,
+impl<P, T, B> Drop for Dispatch<P, T, B> where
+    P: Client<T> + BindClient<StreamingMultiplex<B>, T>,
+    T: Io,
+    B: Stream<Item = P::RequestBody, Error = P::Error>,
 {
     fn drop(&mut self) {
         if !self.in_flight.is_empty() {
